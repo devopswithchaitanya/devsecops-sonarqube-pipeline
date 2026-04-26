@@ -1,0 +1,114 @@
+pipeline {
+    agent any
+
+    environment {
+        SONAR_URL     = credentials('sonar-url')
+        SONAR_TOKEN   = credentials('sonar-token')
+        ECR_REGISTRY  = credentials('ecr-registry')
+        APP_NAME      = 'myapp'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                sh 'npm ci'
+            }
+        }
+
+        stage('Unit Tests') {
+            steps {
+                sh 'npm test -- --coverage'
+            }
+            post {
+                always {
+                    junit 'coverage/junit.xml'
+                    publishHTML([reportDir: 'coverage', reportFiles: 'index.html', reportName: 'Coverage Report'])
+                }
+            }
+        }
+
+        stage('SonarQube Analysis') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh """
+                        sonar-scanner \
+                          -Dsonar.projectKey=${APP_NAME} \
+                          -Dsonar.sources=. \
+                          -Dsonar.host.url=${SONAR_URL} \
+                          -Dsonar.token=${SONAR_TOKEN}
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('OWASP Dependency Check') {
+            steps {
+                dependencyCheck additionalArguments: '--scan ./ --format HTML --failOnCVSS 7', odcInstallation: 'OWASP-DC'
+                dependencyCheckPublisher pattern: '**/dependency-check-report.html'
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh "docker build -t ${APP_NAME}:${env.BUILD_NUMBER} ."
+            }
+        }
+
+        stage('Trivy Scan') {
+            steps {
+                sh """
+                    trivy image --exit-code 1 --severity HIGH,CRITICAL \
+                      --format template --template "@/usr/local/share/trivy/templates/html.tpl" \
+                      -o trivy-report.html ${APP_NAME}:${env.BUILD_NUMBER}
+                """
+            }
+            post {
+                always {
+                    publishHTML([reportDir: '.', reportFiles: 'trivy-report.html', reportName: 'Trivy Security Report'])
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh """
+                    aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    docker tag ${APP_NAME}:${env.BUILD_NUMBER} ${ECR_REGISTRY}/${APP_NAME}:${env.BUILD_NUMBER}
+                    docker push ${ECR_REGISTRY}/${APP_NAME}:${env.BUILD_NUMBER}
+                """
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh """
+                    kubectl set image deployment/${APP_NAME} ${APP_NAME}=${ECR_REGISTRY}/${APP_NAME}:${env.BUILD_NUMBER}
+                    kubectl rollout status deployment/${APP_NAME}
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            slackSend channel: '#devops', color: 'good', message: "✅ Pipeline SUCCESS: ${APP_NAME} build #${env.BUILD_NUMBER}"
+        }
+        failure {
+            slackSend channel: '#devops', color: 'danger', message: "❌ Pipeline FAILED: ${APP_NAME} build #${env.BUILD_NUMBER}"
+        }
+    }
+}
